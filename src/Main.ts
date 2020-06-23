@@ -31,7 +31,7 @@ import { Provisioner } from "./Provisioning";
 import { INTERNAL_ID_LEN } from "./BaseSlackHandler";
 import { SlackRTMHandler } from "./SlackRTMHandler";
 import { ConversationsInfoResponse, ConversationsOpenResponse, AuthTestResponse } from "./SlackResponses";
-import { Datastore, TeamEntry, RoomEntry, RoomType } from "./datastore/Models";
+import { Datastore, TeamEntry, RoomEntry } from "./datastore/Models";
 import { NedbDatastore } from "./datastore/NedbDatastore";
 import { PgDatastore } from "./datastore/postgres/PgDatastore";
 import { SlackClientFactory } from "./SlackClientFactory";
@@ -43,7 +43,6 @@ import { UserAdminRoom } from "./rooms/UserAdminRoom";
 import { TeamSyncer } from "./TeamSyncer";
 import { AppService, AppServiceRegistration } from "matrix-appservice";
 import { SlackGhostStore } from "./SlackGhostStore";
-import { stringify } from "querystring";
 
 const log = Logging.get("Main");
 
@@ -100,6 +99,7 @@ export class Main {
 
     private bridge: Bridge;
     private appservice: AppService;
+    private ready: boolean = false;
 
     // TODO(paul): ugh. this.getBotIntent() doesn't work before .run time
     // So we can't create the StateLookup instance yet
@@ -131,6 +131,7 @@ export class Main {
                 client_secret: config.oauth2.client_secret,
                 main: this,
                 redirect_prefix: redirectPrefix!,
+                template_file: config.oauth2.html_template || path.join(__dirname, ".." , "templates/oauth_result.html.njk") ,
             });
         }
 
@@ -141,6 +142,10 @@ export class Main {
         if ((!config.rtm || !config.rtm.enable) && (!config.slack_hook_port || !config.inbound_uri_prefix)) {
             throw Error("Neither rtm.enable nor slack_hook_port|inbound_uri_prefix is defined in the config." +
             "The bridge must define a listener in order to run");
+        }
+
+        if ((!config.rtm?.enable || !config.oauth2) && config.puppeting?.enabled) {
+            throw Error("Either rtm and/or oaurh2 is not enabled, but puppeting is enabled. Both need to be enabled for puppeting to work");
         }
 
         let bridgeStores = {};
@@ -760,8 +765,27 @@ export class Main {
         });
     }
 
+    private async applyBotProfile() {
+        log.info("Ensuring the bridge bot is registered");
+        const intent = this.botIntent;
+        // The bot believes itself to always be registered, even when it isn't.
+        intent.opts.registered = false;
+        await intent._ensureRegistered();
+        const profile = await intent.getProfileInfo(this.botUserId);
+        if (this.config.bot_profile?.displayname && profile.displayname !== this.config.bot_profile?.displayname) {
+            await intent.setDisplayName(this.config.bot_profile?.displayname);
+        }
+        if (this.config.bot_profile?.avatar_url && profile.avatar_url !== this.config.bot_profile?.avatar_url) {
+            await intent.setAvatarUrl(this.config.bot_profile?.avatar_url);
+        }
+    }
+
     public async run(cliPort: number) {
         log.info("Loading databases");
+        if (this.oauth2) {
+            await this.oauth2.compileTemplates();
+        }
+
         const dbEngine = this.config.db ? this.config.db.engine.toLowerCase() : "nedb";
         if (dbEngine === "postgres") {
             const postgresDb = new PgDatastore(this.config.db!.connectionString);
@@ -819,6 +843,27 @@ export class Main {
         }
         const port = this.config.homeserver.appservice_port || cliPort;
         this.bridge.run(port, this.config, this.appservice);
+
+        this.bridge.addAppServicePath({
+            handler: this.onHealthProbe.bind(this.bridge),
+            method: "GET",
+            path: "/health",
+            checkToken: false,
+        });
+
+        this.bridge.addAppServicePath({
+            handler: this.onReadyProbe.bind(this.bridge),
+            method: "GET",
+            path: "/ready",
+            checkToken: false,
+        });
+
+        this.stateStorage = new StateLookup({
+            client: this.bridge.getIntent().client,
+            eventTypes: ["m.room.member", "m.room.power_levels"],
+        });
+
+
         let joinedRooms: string[]|null = null;
         while(joinedRooms === null) {
             try {
@@ -834,25 +879,19 @@ export class Main {
             }
         }
 
-        this.bridge.addAppServicePath({
-            handler: this.onHealth.bind(this.bridge),
-            method: "GET",
-            path: "/health",
-            checkToken: false,
-        });
+        try {
+            await this.applyBotProfile();
+        } catch (ex) {
+            log.warn(`Failed to set bot profile on startup: ${ex}`);
+        }
 
-        const provisioningEnabled = this.config.provisioning?.enable;
+        const provisioningEnabled = this.config.provisioning?.enabled;
 
         // Previously, this was always true.
         if (provisioningEnabled === undefined ? true : provisioningEnabled) {
             this.provisioner.addAppServicePath();
         }
 
-        // TODO(paul): see above; we had to defer this until now
-        this.stateStorage = new StateLookup({
-            client: this.bridge.getIntent().client,
-            eventTypes: ["m.room.member", "m.room.power_levels"],
-        });
         log.info("Fetching teams");
         const teams = await this.datastore.getAllTeams();
         log.info(`Loaded ${teams.length} teams`);
@@ -922,7 +961,8 @@ export class Main {
         }
         await puppetsWaiting;
         await teamSyncPromise;
-        log.info("Bridge initialised.");
+        log.info("Bridge initialised");
+        this.ready = true;
     }
 
     private async startupLoadRoomEntry(entry: RoomEntry, joinedRooms: string[], teamClients: {[teamId: string]: WebClient}) {
@@ -1116,15 +1156,7 @@ export class Main {
     }
 
     public async setUserAccessToken(userId: string, teamId: string, slackId: string, accessToken: string, puppeting: boolean) {
-        let matrixUser = await this.datastore.getMatrixUser(userId);
-        matrixUser = matrixUser ? matrixUser : new BridgeMatrixUser(userId);
-        const accounts = matrixUser.get("accounts") || {};
-        accounts[slackId] = {
-            access_token: accessToken,
-            team_id: teamId,
-        };
-        matrixUser.set("accounts", accounts);
-        await this.datastore.storeMatrixUser(matrixUser);
+        await this.datastore.insertAccount(userId, slackId, teamId, accessToken);
         if (puppeting) {
             // Store it here too for puppeting.
             await this.datastore.setPuppetToken(teamId, slackId, userId, accessToken);
@@ -1135,16 +1167,11 @@ export class Main {
                 token: accessToken,
             });
         }
-        log.info(`Set new access token for ${userId} (team: ${teamId})`);
+        log.info(`Set new access token for ${userId} (team: ${teamId}, puppeting: ${puppeting})`);
     }
 
     public async matrixUserInSlackTeam(teamId: string, userId: string) {
-        const matrixUser = await this.datastore.getMatrixUser(userId);
-        if (matrixUser === null) {
-            return false;
-        }
-        const accounts: {team_id: string}[] = Object.values(matrixUser.get("accounts"));
-        return accounts.find((acct) => acct.team_id === teamId);
+        return (await this.datastore.getAccountsForMatrixUser(userId)).find((a) => a.teamId === teamId);
     }
 
     public async willExceedTeamLimit(teamId: string) {
@@ -1154,6 +1181,41 @@ export class Main {
         }
         const idSet = new Set((await this.datastore.getAllTeams()).map((t) => t.id));
         return idSet.add(teamId).size > this.config.provisioning?.limits?.team_count;
+    }
+
+    public async logoutAccount(userId: string, slackId: string) {
+        const acct = (await this.datastore.getAccountsForMatrixUser(userId)).find((s) => s.slackId === slackId);
+        if (!acct) {
+            // Account not found
+            return { deleted: false, msg: "Account not found"};
+        }
+
+        const isLastAccountForTeam = !acct.teamId || (await this.datastore.getAccountsForTeam(acct.teamId)).length <= 1;
+        const teamHasRooms = this.rooms.getBySlackTeamId(acct.teamId).length > 0;
+
+        if (isLastAccountForTeam) {
+            if (teamHasRooms) {
+                // If this is the last account for a team and rooms are bridged, we must preserve
+                // the team until all rooms are removed.
+                return { deleted: false, msg: "You are the only user connected to Slack. You must unlink your rooms before you can unlink your account"};
+            }
+            // Last account, but no bridged rooms. We can delete the team safely.
+            await this.clientFactory.dropTeamClient(acct.teamId);
+            await this.datastore.deleteTeam(acct.teamId);
+            log.info(`Removed team ${acct.teamId}`);
+        } // or not even the last account, we can safely remove the team
+
+        try {
+            const client = await this.clientFactory.createClient(acct.accessToken);
+            await client.auth.revoke();
+        } catch (ex) {
+            log.warn('Tried to revoke auth token, but got:', ex);
+            // Even if this fails, we remove the token locally.
+        }
+
+        await this.datastore.deleteAccount(userId, slackId);
+        log.info(`Removed account ${slackId} from ${slackId}`);
+        return { deleted: true };
     }
 
     public async killBridge() {
@@ -1186,8 +1248,11 @@ export class Main {
         } // Otherwise, not a known room.
     }
 
-
-    private onHealth(_, res: Response) {
+    private onHealthProbe(_, res: Response) {
         res.status(201).send("");
+    }
+
+    private onReadyProbe(_, res: Response) {
+        res.status(this.ready ? 201 : 425).send("");
     }
 }

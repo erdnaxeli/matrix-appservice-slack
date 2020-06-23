@@ -121,3 +121,16 @@ properties:
             type: number
           team_count:
             type: number
+  puppeting:
+    type: object
+    required: ["enabled"]
+    properties:
+      enabled:
+        type: boolean
+  bot_profile:
+    type: object
+    properties:
+      displayname:
+        type: string
+      avatar_url:
+        type: string

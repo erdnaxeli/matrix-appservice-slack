@@ -94,11 +94,11 @@ team_sync:
   all:
     channels:
       enabled: false
-  #   whitelist: []
-  #   blacklist: []
-  #   alias_prefix: "slack_"
-  users:
-    enabled: false
+    # whitelist: []
+    # blacklist: []
+    # alias_prefix: "slack_"
+    users:
+      enabled: false
 
 provisioning:
   enabled: true
@@ -110,3 +110,10 @@ provisioning:
     room_count: 20
     team_count: 1
 
+puppeting:
+  # Should the bridge allow users to puppet their accounts
+  enabled: false
+
+bot_profile: # Set the bot's profile on startup, optional
+  displayname: Slack Bridge # Set the displayname, optional
+  avatar_url: "mxc://half-shot.uk/ea64c71ee946ca2f61379abefe2c7d977d276fbb" # Set the avatar, optional
